@@ -67,7 +67,7 @@ func run(log *slog.Logger) error {
 	b := &bridge{
 		api: newClient(socket, token),
 		sig: signalCLI{bin: cfg.SignalCLI, account: cfg.Account, dir: stableDir(), mu: &sync.Mutex{}},
-		cfg: cfg, log: log, seen: map[string]bool{}, pending: map[int64]pendingQ{},
+		cfg: cfg, log: log, seen: map[string]bool{}, pending: map[int64]pendingQ{}, filed: map[int64]filedT{},
 	}
 	if dir := os.Getenv("FORGE_PLUGIN_DIR"); dir != "" {
 		b.stateFile = filepath.Join(dir, "pending.json")
@@ -100,7 +100,11 @@ type bridge struct {
 	// asked, so a Signal *reply* to that message answers it — no /answer <id>.
 	// Bounded and persisted (stateFile) so it neither grows without limit nor is
 	// lost across a restart.
-	pending   map[int64]pendingQ
+	pending map[int64]pendingQ
+	// filed maps a sender's message timestamp to the work the concierge
+	// filed from it, so a ✅ reaction can land on that message when the
+	// work settles, and a ❓ reaction can ask after it.
+	filed     map[int64]filedT
 	stateFile string
 }
 
@@ -108,6 +112,11 @@ type pendingQ struct {
 	QuestionID string   `json:"q"`
 	WorkID     string   `json:"w"`
 	Options    []string `json:"o,omitempty"`
+}
+
+type filedT struct {
+	From   string `json:"f"`
+	WorkID string `json:"w"`
 }
 
 // pendingCap bounds the question→reply map so it never grows without limit;
@@ -232,10 +241,14 @@ func (b *bridge) handle(ctx context.Context, e journalEntry) {
 		if b.cfg.Questions {
 			b.onQuestion(ctx)
 		}
-	case "target.transition":
-		if b.cfg.Failures {
-			b.onTransition(ctx, e)
+	case "question.answered":
+		// Answered anywhere (UI, CLI, another channel): the notification
+		// message gets its ✅ so the phone shows it's handled.
+		if ts := b.takePendingByQuestion(e.EntityID); ts != 0 {
+			b.react(ctx, b.cfg.Recipient, b.cfg.Account, ts, "✅")
 		}
+	case "target.transition":
+		b.onTransition(ctx, e) // gates failure sends on cfg.Failures itself
 	case "proposal.created":
 		if b.cfg.Proposals {
 			b.onProposal(ctx, e)
@@ -295,8 +308,19 @@ func (b *bridge) onTransition(ctx context.Context, e journalEntry) {
 	if state == "" {
 		state = p.State
 	}
+	// A work filed from a chat message that lands well gets a ✅ on the
+	// message that asked for it.
+	if state == "merged" || state == "succeeded" {
+		if f, ts, ok := b.takeFiledByWork(p.WorkID); ok {
+			b.react(ctx, f.From, f.From, ts, "✅")
+		}
+		return
+	}
 	if state != "failed" && state != "unverified" {
 		return // only surface the bad transitions
+	}
+	if !b.cfg.Failures {
+		return
 	}
 	if strings.HasPrefix(p.Repository, "bench-") {
 		return // bench trees fail and self-correct by design; not page-worthy
@@ -349,15 +373,92 @@ func (b *bridge) runInbound(ctx context.Context) error {
 				b.log.Info("ignoring message from unknown sender", "from", m.From)
 				continue
 			}
-			b.command(ctx, m.Text, m.QuoteID, m.From)
+			if m.Emoji != "" {
+				b.onReaction(ctx, m)
+				continue
+			}
+			b.command(ctx, m)
 		}
 	}
 	return ctx.Err()
 }
 
+// onReaction interprets an emoji reaction on one of our messages (or on a
+// message that filed a task): 👍/👎 answers a yes/no question, ❓ asks for a
+// plain-language summary, anything else is ignored.
+func (b *bridge) onReaction(ctx context.Context, m incoming) {
+	reply := func(msg string) { b.sendTo(ctx, m.From, msg) }
+	operator := sameNumber(m.From, b.cfg.Recipient)
+	explain := strings.HasPrefix(m.Emoji, "❓") || strings.HasPrefix(m.Emoji, "❔") || strings.HasPrefix(m.Emoji, "🤔")
+	if pq, ok := b.peekPending(m.ReactedTo); ok {
+		switch {
+		case strings.HasPrefix(m.Emoji, "👍"), strings.HasPrefix(m.Emoji, "👎"):
+			if !operator {
+				reply("Only the operator can answer Forge's questions.")
+				return
+			}
+			answer := "yes"
+			if strings.HasPrefix(m.Emoji, "👎") {
+				answer = "no"
+			}
+			if err := b.api.AnswerQuestion(ctx, pq.QuestionID, answer); err != nil {
+				reply("Answer failed: " + errMessage(err))
+				return
+			}
+			// The ✅ lands via the question.answered journal event.
+		case explain:
+			prompt := "In a few plain sentences, explain what this question from task " + shortID(pq.WorkID) +
+				" is asking me to decide, what each option would mean in practice, and what you'd pick:\n" + questionRecap(ctx, b, pq)
+			b.withTyping(ctx, m.From, func() {
+				out, err := b.api.Assistant(ctx, m.From, prompt)
+				if err != nil {
+					reply("Couldn't summarize that: " + errMessage(err))
+					return
+				}
+				reply(out.Reply)
+			})
+		}
+		return
+	}
+	if explain {
+		b.mu.Lock()
+		f, ok := b.filed[m.ReactedTo]
+		b.mu.Unlock()
+		if ok {
+			b.withTyping(ctx, m.From, func() {
+				out, err := b.api.Assistant(ctx, m.From, "Briefly: what is task "+shortID(f.WorkID)+" doing, what state is it in, and does it need anything from me?")
+				if err != nil {
+					reply("Couldn't check on that: " + errMessage(err))
+					return
+				}
+				reply(out.Reply)
+			})
+		}
+	}
+}
+
+// questionRecap renders the open question's text and options for a summary
+// prompt; falls back to the task id when the question is no longer open.
+func questionRecap(ctx context.Context, b *bridge, pq pendingQ) string {
+	at, err := b.api.Attention(ctx)
+	if err == nil {
+		for _, q := range at.Questions {
+			if q.ID == pq.QuestionID {
+				s := q.Text
+				for i, o := range q.Options {
+					s += fmt.Sprintf("\n%d) %s", i+1, o)
+				}
+				return s
+			}
+		}
+	}
+	return "(the question on task " + shortID(pq.WorkID) + " — it may already be closed)"
+}
+
 // command interprets one inbound message: a reply to a question (answers it), a
 // /-command, or a bare request that becomes a task.
-func (b *bridge) command(ctx context.Context, text string, quoteID int64, from string) {
+func (b *bridge) command(ctx context.Context, m incoming) {
+	text, quoteID, from := m.Text, m.QuoteID, m.From
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return
@@ -389,6 +490,9 @@ func (b *bridge) command(ctx context.Context, text string, quoteID int64, from s
 		b.mu.Lock()
 		delete(b.seen, pq.QuestionID)
 		b.mu.Unlock()
+		// takePending consumed the entry, so the question.answered event
+		// can't find it — put the ✅ on the question message here.
+		b.react(ctx, b.cfg.Recipient, b.cfg.Account, quoteID, "✅")
 		reply("Answered task " + shortID(pq.WorkID) + ".")
 		return
 	}
@@ -406,14 +510,19 @@ func (b *bridge) command(ctx context.Context, text string, quoteID int64, from s
 		return
 	}
 	// Everything else goes to the concierge: natural language in, action out.
-	out, err := b.api.Assistant(ctx, from, text)
-	if err != nil {
-		reply("Sorry, I hit an error reaching Forge: " + errMessage(err))
-		return
-	}
-	if out != "" {
-		reply(out)
-	}
+	b.withTyping(ctx, from, func() {
+		out, err := b.api.Assistant(ctx, from, text)
+		if err != nil {
+			reply("Sorry, I hit an error reaching Forge: " + errMessage(err))
+			return
+		}
+		if id, ok := strings.CutPrefix(out.Ref, "work:"); ok {
+			b.rememberFiled(m.Timestamp, from, id)
+		}
+		if out.Reply != "" {
+			reply(out.Reply)
+		}
+	})
 }
 
 func (b *bridge) answer(ctx context.Context, from, taskRef, answer string) {
@@ -482,17 +591,119 @@ func (b *bridge) takePending(quoteID int64) (pendingQ, bool) {
 	return pq, ok
 }
 
-// savePendingLocked writes the map to stateFile (caller holds b.mu); JSON keys
-// are strings, so the millisecond timestamps are stringified.
+// peekPending is takePending without consuming — for reactions that inform
+// rather than answer.
+func (b *bridge) peekPending(ts int64) (pendingQ, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pq, ok := b.pending[ts]
+	return pq, ok
+}
+
+// takePendingByQuestion removes a pending entry by question id and returns the
+// message timestamp it was announced with (0 if unknown).
+func (b *bridge) takePendingByQuestion(questionID string) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ts, pq := range b.pending {
+		if pq.QuestionID == questionID {
+			delete(b.pending, ts)
+			b.savePendingLocked()
+			return ts
+		}
+	}
+	return 0
+}
+
+// rememberFiled records sender-message-ts → filed work, capped like pending.
+func (b *bridge) rememberFiled(ts int64, from, workID string) {
+	if ts == 0 || workID == "" {
+		return
+	}
+	b.mu.Lock()
+	b.filed[ts] = filedT{From: from, WorkID: workID}
+	for len(b.filed) > pendingCap {
+		oldest, first := int64(0), true
+		for k := range b.filed {
+			if first || k < oldest {
+				oldest, first = k, false
+			}
+		}
+		delete(b.filed, oldest)
+	}
+	b.savePendingLocked()
+	b.mu.Unlock()
+}
+
+// takeFiledByWork removes a filed entry by work id, returning the sender and
+// message timestamp (ok=false if the work wasn't filed from a message).
+func (b *bridge) takeFiledByWork(workID string) (filedT, int64, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ts, f := range b.filed {
+		if f.WorkID == workID {
+			delete(b.filed, ts)
+			b.savePendingLocked()
+			return f, ts, true
+		}
+	}
+	return filedT{}, 0, false
+}
+
+// react puts an emoji on a message in the chat with `chat`; best effort.
+func (b *bridge) react(ctx context.Context, chat, author string, ts int64, emoji string) {
+	if ts == 0 {
+		return
+	}
+	if err := b.sig.react(ctx, chat, author, ts, emoji); err != nil && ctx.Err() == nil {
+		b.log.Warn("signal react", "err", err)
+	}
+}
+
+// withTyping shows the "is typing…" indicator for the duration of fn,
+// refreshing it (clients expire it after ~15s) and clearing it after.
+func (b *bridge) withTyping(ctx context.Context, to string, fn func()) {
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		_ = b.sig.typing(ctx, to, false)
+		for {
+			select {
+			case <-done:
+				_ = b.sig.typing(ctx, to, true)
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				_ = b.sig.typing(ctx, to, false)
+			}
+		}
+	}()
+	fn()
+	close(done)
+}
+
+// persistedState is the stateFile shape; JSON keys are strings, so the
+// millisecond timestamps are stringified.
+type persistedState struct {
+	Pending map[string]pendingQ `json:"pending"`
+	Filed   map[string]filedT   `json:"filed,omitempty"`
+}
+
+// savePendingLocked writes both maps to stateFile (caller holds b.mu).
 func (b *bridge) savePendingLocked() {
 	if b.stateFile == "" {
 		return
 	}
-	m := make(map[string]pendingQ, len(b.pending))
+	st := persistedState{Pending: make(map[string]pendingQ, len(b.pending)), Filed: make(map[string]filedT, len(b.filed))}
 	for k, v := range b.pending {
-		m[strconv.FormatInt(k, 10)] = v
+		st.Pending[strconv.FormatInt(k, 10)] = v
 	}
-	data, err := json.Marshal(m)
+	for k, v := range b.filed {
+		st.Filed[strconv.FormatInt(k, 10)] = v
+	}
+	data, err := json.Marshal(st)
 	if err != nil {
 		return
 	}
@@ -501,20 +712,30 @@ func (b *bridge) savePendingLocked() {
 	}
 }
 
-// loadPending restores the map from stateFile on start (best effort).
+// loadPending restores the maps from stateFile on start (best effort). The
+// pre-filed format was the bare pending map; both shapes load.
 func (b *bridge) loadPending() {
 	data, err := os.ReadFile(b.stateFile)
 	if err != nil {
 		return
 	}
-	var m map[string]pendingQ
-	if json.Unmarshal(data, &m) != nil {
-		return
+	var st persistedState
+	if json.Unmarshal(data, &st) != nil || st.Pending == nil {
+		var legacy map[string]pendingQ
+		if json.Unmarshal(data, &legacy) != nil {
+			return
+		}
+		st = persistedState{Pending: legacy}
 	}
 	b.mu.Lock()
-	for k, v := range m {
+	for k, v := range st.Pending {
 		if ts, perr := strconv.ParseInt(k, 10, 64); perr == nil {
 			b.pending[ts] = v
+		}
+	}
+	for k, v := range st.Filed {
+		if ts, perr := strconv.ParseInt(k, 10, 64); perr == nil {
+			b.filed[ts] = v
 		}
 	}
 	b.mu.Unlock()

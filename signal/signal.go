@@ -46,6 +46,45 @@ func (s signalCLI) send(ctx context.Context, recipient, message string) (int64, 
 	return parseSendTimestamp(stdout.String()), nil
 }
 
+// react puts an emoji reaction on a message, identified by its author and
+// timestamp — the Signal wire's message id. Failures are returned, never fatal.
+func (s signalCLI) react(ctx context.Context, recipient, targetAuthor string, targetTS int64, emoji string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, s.bin, "-a", s.account, "sendReaction",
+		"-e", emoji, "-a", targetAuthor, "-t", strconv.FormatInt(targetTS, 10), recipient)
+	cmd.Dir = s.dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("signal-cli sendReaction: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// typing shows (or clears, with stop) the "is typing…" indicator. Signal
+// clients expire it after ~15s, so a long operation must refresh it.
+func (s signalCLI) typing(ctx context.Context, recipient string, stop bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	args := []string{"-a", s.account, "sendTyping"}
+	if stop {
+		args = append(args, "-s")
+	}
+	cmd := exec.CommandContext(cctx, s.bin, append(args, recipient)...)
+	cmd.Dir = s.dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("signal-cli sendTyping: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // parseSendTimestamp pulls the sent-message id (a millisecond timestamp) that
 // signal-cli prints on stdout; 0 if none is found (send still succeeded).
 func parseSendTimestamp(out string) int64 {
@@ -57,24 +96,35 @@ func parseSendTimestamp(out string) int64 {
 	return 0
 }
 
-// incoming is one received text message.
+// incoming is one received text message or emoji reaction.
 type incoming struct {
-	From    string
-	Text    string
-	QuoteID int64 // the timestamp of the message this one replies to (0 if not a reply)
+	From      string
+	Text      string
+	QuoteID   int64 // the timestamp of the message this one replies to (0 if not a reply)
+	Timestamp int64 // this message's own id on the wire
+	// Reaction fields: Emoji set means this is a reaction to the message
+	// sent at ReactedTo, and Text is empty.
+	Emoji     string
+	ReactedTo int64
 }
 
 // envelope is the slice of signal-cli's `-o json receive` output this plugin
-// needs: the sender and the message body.
+// needs: the sender, the message body, and reactions.
 type envelope struct {
 	Envelope struct {
 		Source       string `json:"source"`
 		SourceNumber string `json:"sourceNumber"`
+		Timestamp    int64  `json:"timestamp"`
 		DataMessage  struct {
 			Message string `json:"message"`
 			Quote   struct {
 				ID int64 `json:"id"`
 			} `json:"quote"`
+			Reaction struct {
+				Emoji               string `json:"emoji"`
+				TargetSentTimestamp int64  `json:"targetSentTimestamp"`
+				IsRemove            bool   `json:"isRemove"`
+			} `json:"reaction"`
 		} `json:"dataMessage"`
 	} `json:"envelope"`
 }
@@ -115,15 +165,19 @@ func (s signalCLI) receive(ctx context.Context, timeout time.Duration) ([]incomi
 		if json.Unmarshal(line, &e) != nil {
 			continue
 		}
-		text := strings.TrimSpace(e.Envelope.DataMessage.Message)
-		if text == "" {
-			continue
-		}
 		from := e.Envelope.Source
 		if from == "" {
 			from = e.Envelope.SourceNumber
 		}
-		msgs = append(msgs, incoming{From: from, Text: text, QuoteID: e.Envelope.DataMessage.Quote.ID})
+		if r := e.Envelope.DataMessage.Reaction; r.Emoji != "" && !r.IsRemove {
+			msgs = append(msgs, incoming{From: from, Timestamp: e.Envelope.Timestamp, Emoji: r.Emoji, ReactedTo: r.TargetSentTimestamp})
+			continue
+		}
+		text := strings.TrimSpace(e.Envelope.DataMessage.Message)
+		if text == "" {
+			continue
+		}
+		msgs = append(msgs, incoming{From: from, Text: text, QuoteID: e.Envelope.DataMessage.Quote.ID, Timestamp: e.Envelope.Timestamp})
 	}
 	return msgs, sc.Err()
 }

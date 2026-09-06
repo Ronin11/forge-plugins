@@ -189,15 +189,20 @@ func (c *client) AnswerQuestion(ctx context.Context, questionID, answer string) 
 	return c.do(ctx, http.MethodPost, "/api/v1/questions/"+questionID+"/answer", body, nil)
 }
 
+// assistantReply is the concierge's answer plus the referent it touched
+// ("work:<id>" when it filed a task, "" otherwise).
+type assistantReply struct {
+	Reply string `json:"reply"`
+	Ref   string `json:"ref"`
+}
+
 // Assistant sends a message to the concierge and returns its reply.
-func (c *client) Assistant(ctx context.Context, sender, text string) (string, error) {
-	var out struct {
-		Reply string `json:"reply"`
-	}
+func (c *client) Assistant(ctx context.Context, sender, text string) (assistantReply, error) {
+	var out assistantReply
 	if err := c.do(ctx, http.MethodPost, "/api/v1/assistant/message", map[string]string{"sender": sender, "text": text}, &out); err != nil {
-		return "", err
+		return assistantReply{}, err
 	}
-	return out.Reply, nil
+	return out, nil
 }
 
 // Ack persists the plugin's journal cursor so a restart resumes with no gaps.
