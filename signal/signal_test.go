@@ -74,7 +74,7 @@ func TestPendingBoundAndPersist(t *testing.T) {
 	}
 	b := nb()
 	for i := int64(1); i <= pendingCap+50; i++ {
-		b.rememberQuestion(i, "q", "w")
+		b.rememberQuestion(i, "q", "w", nil)
 	}
 	if len(b.pending) != pendingCap {
 		t.Fatalf("bounded size = %d, want %d", len(b.pending), pendingCap)

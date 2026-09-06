@@ -50,9 +50,10 @@ type attentionView struct {
 }
 
 type questionView struct {
-	ID     string `json:"id"`
-	WorkID string `json:"work_id"`
-	Text   string `json:"text"`
+	ID      string   `json:"id"`
+	WorkID  string   `json:"work_id"`
+	Text    string   `json:"text"`
+	Options []string `json:"options"`
 }
 
 // journalEntry is one row of GET /api/v1/journal — the audit-trail shape of

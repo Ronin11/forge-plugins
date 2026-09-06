@@ -105,8 +105,9 @@ type bridge struct {
 }
 
 type pendingQ struct {
-	QuestionID string `json:"q"`
-	WorkID     string `json:"w"`
+	QuestionID string   `json:"q"`
+	WorkID     string   `json:"w"`
+	Options    []string `json:"o,omitempty"`
 }
 
 // pendingCap bounds the question→reply map so it never grows without limit;
@@ -258,9 +259,19 @@ func (b *bridge) onQuestion(ctx context.Context) {
 		}
 		b.seen[q.ID] = true
 		short := shortID(q.WorkID)
-		ts := b.send(ctx, fmt.Sprintf("Forge needs input on task %s:\n%s\n%s/tasks/%s\nReply to this message with your answer (or /answer %s <text>).", short, q.Text, b.cfg.UI, q.WorkID, short))
+		var msg strings.Builder
+		fmt.Fprintf(&msg, "Forge needs input on task %s:\n%s\n", short, q.Text)
+		for i, opt := range q.Options {
+			fmt.Fprintf(&msg, "%d) %s\n", i+1, opt)
+		}
+		hint := "Reply to this message with your answer"
+		if len(q.Options) > 0 {
+			hint = "Reply with a number, or your own answer if none fit"
+		}
+		fmt.Fprintf(&msg, "%s/tasks/%s\n%s (or /answer %s <text>).", b.cfg.UI, q.WorkID, hint, short)
+		ts := b.send(ctx, msg.String())
 		if ts != 0 {
-			b.rememberQuestion(ts, q.ID, q.WorkID)
+			b.rememberQuestion(ts, q.ID, q.WorkID, q.Options)
 		}
 	}
 }
@@ -286,6 +297,9 @@ func (b *bridge) onTransition(ctx context.Context, e journalEntry) {
 	}
 	if state != "failed" && state != "unverified" {
 		return // only surface the bad transitions
+	}
+	if strings.HasPrefix(p.Repository, "bench-") {
+		return // bench trees fail and self-correct by design; not page-worthy
 	}
 	repo := p.Repository
 	if repo == "" {
@@ -362,8 +376,13 @@ func (b *bridge) command(ctx context.Context, text string, quoteID int64, from s
 			reply("That question isn't open anymore. Reply to a current one, or send a new request as a fresh message (not a reply).")
 			return
 		}
-		if err := b.api.AnswerQuestion(ctx, pq.QuestionID, text); err != nil {
-			b.rememberQuestion(quoteID, pq.QuestionID, pq.WorkID) // put it back to retry
+		answer := text
+		// A bare number selects that option from the question's list.
+		if n, err := strconv.Atoi(text); err == nil && n >= 1 && n <= len(pq.Options) {
+			answer = pq.Options[n-1]
+		}
+		if err := b.api.AnswerQuestion(ctx, pq.QuestionID, answer); err != nil {
+			b.rememberQuestion(quoteID, pq.QuestionID, pq.WorkID, pq.Options) // put it back to retry
 			reply("Answer failed: " + errMessage(err))
 			return
 		}
@@ -435,9 +454,9 @@ func stableDir() string {
 
 // rememberQuestion records a sent question notification's timestamp → question,
 // evicts the oldest entries past the cap, and persists the map.
-func (b *bridge) rememberQuestion(ts int64, questionID, workID string) {
+func (b *bridge) rememberQuestion(ts int64, questionID, workID string, options []string) {
 	b.mu.Lock()
-	b.pending[ts] = pendingQ{QuestionID: questionID, WorkID: workID}
+	b.pending[ts] = pendingQ{QuestionID: questionID, WorkID: workID, Options: options}
 	for len(b.pending) > pendingCap {
 		oldest, first := int64(0), true
 		for k := range b.pending {
