@@ -146,26 +146,26 @@ func (s *server) serve(in *os.File, out *os.File) error {
 func toolDefs() []map[string]any {
 	obj := func(schema string) json.RawMessage { return json.RawMessage(schema) }
 	return []map[string]any{
-		{"name": "namecheap_check", "description": "Check registration availability for up to 20 domain names at once (premium names are flagged with their price).",
+		{"name": "check", "description": "Check registration availability for up to 20 domain names at once (premium names are flagged with their price).",
 			"inputSchema": obj(`{"type":"object","properties":{"domains":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20}},"required":["domains"],"additionalProperties":false}`)},
-		{"name": "namecheap_pricing", "description": "First-year registration price per TLD (USD).",
+		{"name": "pricing", "description": "First-year registration price per TLD (USD).",
 			"inputSchema": obj(`{"type":"object","properties":{"tld":{"type":"string","description":"e.g. \"com\", no dot"}},"required":["tld"],"additionalProperties":false}`)},
-		{"name": "namecheap_register", "description": "Register a domain — SPENDS REAL MONEY from the Namecheap account balance. Requires question_id: an answered Human Queue question whose text names this exact domain and whose answer approves. Also gated by the plugin's spend cap and TLD allowlist. Ask the question with forge_ask first, wait for the answer, then call this.",
+		{"name": "register", "description": "Register a domain — SPENDS REAL MONEY from the Namecheap account balance. Requires question_id: an answered Human Queue question whose text names this exact domain and whose answer approves. Also gated by the plugin's spend cap and TLD allowlist. Ask the question with forge_ask first, wait for the answer, then call this.",
 			"inputSchema": obj(`{"type":"object","properties":{"domain":{"type":"string"},"years":{"type":"integer","minimum":1,"maximum":2,"default":1},"question_id":{"type":"string"}},"required":["domain","question_id"],"additionalProperties":false}`)},
-		{"name": "namecheap_dns_set", "description": "Replace a registered domain's DNS host records (replaces ALL records — include every record the domain should have). For GitHub Pages: four A records @ 185.199.108-111.153 and a www CNAME to <user>.github.io.",
+		{"name": "dns_set", "description": "Replace a registered domain's DNS host records (replaces ALL records — include every record the domain should have). For GitHub Pages: four A records @ 185.199.108-111.153 and a www CNAME to <user>.github.io.",
 			"inputSchema": obj(`{"type":"object","properties":{"domain":{"type":"string"},"records":{"type":"array","items":{"type":"object","properties":{"host":{"type":"string","description":"@ or a subdomain"},"type":{"type":"string","enum":["A","AAAA","CNAME","TXT","MX"]},"value":{"type":"string"},"ttl":{"type":"integer","default":1800}},"required":["host","type","value"],"additionalProperties":false},"minItems":1}},"required":["domain","records"],"additionalProperties":false}`)},
 	}
 }
 
 func (s *server) dispatch(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	switch name {
-	case "namecheap_check":
+	case "check":
 		return s.check(ctx, args)
-	case "namecheap_pricing":
+	case "pricing":
 		return s.pricing(ctx, args)
-	case "namecheap_register":
+	case "register":
 		return s.register(ctx, args)
-	case "namecheap_dns_set":
+	case "dns_set":
 		return s.dnsSet(ctx, args)
 	}
 	return "", fmt.Errorf("unknown tool %s", name)
