@@ -1,0 +1,8 @@
+name = "namecheap"
+version = "0.1.0"
+description = "Namecheap domain tools for agents: availability, pricing, DNS — and registration gated behind an approved Human Queue question plus a config spend cap. The API key lives in namecheap.toml, never in agent context. Requires API access enabled on the Namecheap account and this machine's public IP whitelisted."
+build = ["go", "build", "-o", "forge-namecheap", "."]
+command = ["./forge-namecheap"]
+capabilities = ["tools"]
+scopes = ["work:read"]
+restart = "always"
