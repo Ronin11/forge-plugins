@@ -13,12 +13,13 @@ import (
 
 // config is the plugin's settings.
 type config struct {
-	Account     string // the Signal number Forge sends from, e.g. "+15551234567"
-	Recipient   string // the number/username notified, and the only sender whose commands are honored
-	SignalCLI   string // signal-cli binary (path or name on PATH)
-	PollSeconds int    // inbound receive cadence
-	UI          string // base UI URL put in notification bodies
-	DefaultRepo string // repo for a bare "task …" command with no repo
+	Account     string   // the Signal number Forge sends from, e.g. "+15551234567"
+	Recipient   string   // the primary: notified of events, and the only sender who may answer questions
+	Recipients  []string // all honored senders (family); defaults to [Recipient]
+	SignalCLI   string   // signal-cli binary (path or name on PATH)
+	PollSeconds int      // inbound receive cadence
+	UI          string   // base UI URL put in notification bodies
+	DefaultRepo string   // repo for a bare "task …" command with no repo
 	// Outbound toggles (all default on).
 	Questions  bool
 	Failures   bool
@@ -51,17 +52,18 @@ func loadConfig(path string) (config, error) {
 	}
 	var file struct {
 		Signal struct {
-			Account     string `toml:"account"`
-			Recipient   string `toml:"recipient"`
-			SignalCLI   string `toml:"signal_cli"`
-			PollSeconds int    `toml:"poll_seconds"`
-			UI          string `toml:"ui"`
-			DefaultRepo string `toml:"default_repo"`
-			Questions   *bool  `toml:"questions"`
-			Failures    *bool  `toml:"failures"`
-			Proposals   *bool  `toml:"proposals"`
-			Throttling  *bool  `toml:"throttling"`
-			Intake      *bool  `toml:"intake"`
+			Account     string   `toml:"account"`
+			Recipient   string   `toml:"recipient"`
+			Recipients  []string `toml:"recipients"`
+			SignalCLI   string   `toml:"signal_cli"`
+			PollSeconds int      `toml:"poll_seconds"`
+			UI          string   `toml:"ui"`
+			DefaultRepo string   `toml:"default_repo"`
+			Questions   *bool    `toml:"questions"`
+			Failures    *bool    `toml:"failures"`
+			Proposals   *bool    `toml:"proposals"`
+			Throttling  *bool    `toml:"throttling"`
+			Intake      *bool    `toml:"intake"`
 		} `toml:"signal"`
 	}
 	if err := toml.Unmarshal(b, &file); err != nil {
@@ -69,6 +71,13 @@ func loadConfig(path string) (config, error) {
 	}
 	sig := file.Signal
 	cfg.Account, cfg.Recipient, cfg.DefaultRepo = sig.Account, sig.Recipient, sig.DefaultRepo
+	cfg.Recipients = sig.Recipients
+	if len(cfg.Recipients) == 0 && cfg.Recipient != "" {
+		cfg.Recipients = []string{cfg.Recipient}
+	}
+	if cfg.Recipient == "" && len(cfg.Recipients) > 0 {
+		cfg.Recipient = cfg.Recipients[0]
+	}
 	if sig.SignalCLI != "" {
 		cfg.SignalCLI = sig.SignalCLI
 	}

@@ -1,5 +1,6 @@
 [signal]
 account      = "+15551234567"
+# recipients = ["+1AAA5551234", "+1BBB5555678"]  # all honored senders; first (or `recipient`) is the operator — the only one who may answer questions
 recipient    = "+15559876543"
 default_repo = "equitizr"
 # signal_cli  = "signal-cli"

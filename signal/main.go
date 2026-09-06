@@ -113,14 +113,29 @@ type pendingQ struct {
 // oldest (smallest timestamp) entries are evicted first.
 const pendingCap = 200
 
-// send is the one place a Signal message leaves; a failure is logged, not fatal.
-// It returns the sent-message timestamp so a question can be matched to a reply.
+// send notifies the primary recipient (events, questions); sendTo replies to
+// whichever sender asked. A failure is logged, not fatal. send returns the
+// sent-message timestamp so a question can be matched to a reply.
 func (b *bridge) send(ctx context.Context, msg string) int64 {
-	ts, err := b.sig.send(ctx, b.cfg.Recipient, msg)
+	return b.sendTo(ctx, b.cfg.Recipient, msg)
+}
+
+func (b *bridge) sendTo(ctx context.Context, to, msg string) int64 {
+	ts, err := b.sig.send(ctx, to, msg)
 	if err != nil && ctx.Err() == nil {
-		b.log.Warn("signal send", "err", err)
+		b.log.Warn("signal send", "err", err, "to", to)
 	}
 	return ts
+}
+
+// allowedSender reports whether a sender is in the honored set.
+func (b *bridge) allowedSender(from string) bool {
+	for _, r := range b.cfg.Recipients {
+		if sameNumber(from, r) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- outbound: journal -> Signal ----
@@ -316,8 +331,8 @@ func (b *bridge) runInbound(ctx context.Context) error {
 			continue
 		}
 		for _, m := range msgs {
-			if !sameNumber(m.From, b.cfg.Recipient) {
-				b.log.Info("ignoring message from non-recipient", "from", m.From)
+			if !b.allowedSender(m.From) {
+				b.log.Info("ignoring message from unknown sender", "from", m.From)
 				continue
 			}
 			b.command(ctx, m.Text, m.QuoteID, m.From)
@@ -333,67 +348,78 @@ func (b *bridge) command(ctx context.Context, text string, quoteID int64, from s
 	if text == "" {
 		return
 	}
+	reply := func(msg string) { b.sendTo(ctx, from, msg) }
+	operator := sameNumber(from, b.cfg.Recipient)
 	// A reply always means "answer" — never a new task. If it matches a known
 	// question, answer it; if not, say so rather than filing a stray task.
 	if quoteID != 0 {
+		if !operator {
+			reply("Only the operator can answer Forge's questions — but ask me anything as a normal message.")
+			return
+		}
 		pq, ok := b.takePending(quoteID)
 		if !ok {
-			b.send(ctx, "That question isn't open anymore. Reply to a current one, or send a new request as a fresh message (not a reply).")
+			reply("That question isn't open anymore. Reply to a current one, or send a new request as a fresh message (not a reply).")
 			return
 		}
 		if err := b.api.AnswerQuestion(ctx, pq.QuestionID, text); err != nil {
 			b.rememberQuestion(quoteID, pq.QuestionID, pq.WorkID) // put it back to retry
-			b.send(ctx, "Answer failed: "+errMessage(err))
+			reply("Answer failed: " + errMessage(err))
 			return
 		}
 		b.mu.Lock()
 		delete(b.seen, pq.QuestionID)
 		b.mu.Unlock()
-		b.send(ctx, "Answered task "+shortID(pq.WorkID)+".")
+		reply("Answered task " + shortID(pq.WorkID) + ".")
 		return
 	}
 	// /answer <id> <text> stays a deterministic fast-path.
 	if fields := strings.Fields(text); strings.EqualFold(fields[0], "/answer") {
-		if len(fields) < 3 {
-			b.send(ctx, "Usage: /answer <task-id> <your answer>")
+		if !operator {
+			reply("Only the operator can answer Forge's questions — but ask me anything as a normal message.")
 			return
 		}
-		b.answer(ctx, fields[1], strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, fields[0]), " "+fields[1])))
+		if len(fields) < 3 {
+			reply("Usage: /answer <task-id> <your answer>")
+			return
+		}
+		b.answer(ctx, from, fields[1], strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, fields[0]), " "+fields[1])))
 		return
 	}
 	// Everything else goes to the concierge: natural language in, action out.
-	reply, err := b.api.Assistant(ctx, from, text)
+	out, err := b.api.Assistant(ctx, from, text)
 	if err != nil {
-		b.send(ctx, "Sorry, I hit an error reaching Forge: "+errMessage(err))
+		reply("Sorry, I hit an error reaching Forge: " + errMessage(err))
 		return
 	}
-	if reply != "" {
-		b.send(ctx, reply)
+	if out != "" {
+		reply(out)
 	}
 }
 
-func (b *bridge) answer(ctx context.Context, taskRef, answer string) {
+func (b *bridge) answer(ctx context.Context, from, taskRef, answer string) {
+	reply := func(msg string) { b.sendTo(ctx, from, msg) }
 	if strings.TrimSpace(answer) == "" {
-		b.send(ctx, "Give an answer: /answer <task-id> <text>")
+		reply("Give an answer: /answer <task-id> <text>")
 		return
 	}
 	at, err := b.api.Attention(ctx)
 	if err != nil {
-		b.send(ctx, "Couldn't read the queue: "+errMessage(err))
+		reply("Couldn't read the queue: " + errMessage(err))
 		return
 	}
 	for _, q := range at.Questions {
 		if strings.HasPrefix(q.WorkID, taskRef) {
 			if err := b.api.AnswerQuestion(ctx, q.ID, answer); err != nil {
-				b.send(ctx, "Answer failed: "+errMessage(err))
+				reply("Answer failed: " + errMessage(err))
 				return
 			}
 			delete(b.seen, q.ID)
-			b.send(ctx, "Answered task "+shortID(q.WorkID)+".")
+			reply("Answered task " + shortID(q.WorkID) + ".")
 			return
 		}
 	}
-	b.send(ctx, "No open question for task "+taskRef+".")
+	reply("No open question for task " + taskRef + ".")
 }
 
 // ---- helpers ----
