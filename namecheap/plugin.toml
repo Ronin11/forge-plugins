@@ -4,5 +4,5 @@ description = "Namecheap domain tools for agents: availability, pricing, DNS —
 build = ["go", "build", "-o", "forge-namecheap", "."]
 command = ["./forge-namecheap"]
 capabilities = ["tools"]
-scopes = ["work:read"]
+scopes = ["work:read", "tools:provide"]
 restart = "always"
