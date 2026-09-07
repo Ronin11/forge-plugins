@@ -6,3 +6,16 @@ client_ip = "this machine's public IPv4 (must be whitelisted in API Access)"
 # The registration gate: both must pass, on top of the approved question.
 max_usd_per_purchase = 20.0
 allowed_tlds = ["com", "dev", "io", "net", "org", "app"]
+
+# Required for domain registration (namecheap.domains.create): the contact
+# record sent for all four roles. Phone format "+1.8015551234".
+[registrant]
+first_name = ""
+last_name = ""
+address1 = ""
+city = ""
+state_province = ""
+postal_code = ""
+country = "US"
+phone = ""
+email = ""

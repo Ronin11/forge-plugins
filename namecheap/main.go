@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,49 @@ type config struct {
 		MaxUSDPerPurchase float64  `toml:"max_usd_per_purchase"`
 		AllowedTLDs       []string `toml:"allowed_tlds"`
 	} `toml:"namecheap"`
+	// Registrant is the contact record Namecheap legally requires on
+	// domains.create (sent for all four roles: registrant/tech/admin/aux
+	// billing). Config-only, like the API key — never in agent context.
+	// Phone must be "+NNN.NNNNNNNNNN" (e.g. "+1.8015551234").
+	Registrant struct {
+		FirstName     string `toml:"first_name"`
+		LastName      string `toml:"last_name"`
+		Address1      string `toml:"address1"`
+		City          string `toml:"city"`
+		StateProvince string `toml:"state_province"`
+		PostalCode    string `toml:"postal_code"`
+		Country       string `toml:"country"`
+		Phone         string `toml:"phone"`
+		Email         string `toml:"email"`
+	} `toml:"registrant"`
+}
+
+// registrantParams builds the four contact-role parameter sets domains.create
+// requires, or an error naming the missing config fields.
+func (c *config) registrantParams() (map[string]string, error) {
+	r := c.Registrant
+	fields := map[string]string{
+		"FirstName": r.FirstName, "LastName": r.LastName, "Address1": r.Address1,
+		"City": r.City, "StateProvince": r.StateProvince, "PostalCode": r.PostalCode,
+		"Country": r.Country, "Phone": r.Phone, "EmailAddress": r.Email,
+	}
+	var missing []string
+	for k, v := range fields {
+		if strings.TrimSpace(v) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("registration needs the [registrant] section in the plugin's namecheap.toml (missing: %s) — the OPERATOR must fill it in the config file; do not ask for these values in chat", strings.Join(missing, ", "))
+	}
+	out := map[string]string{}
+	for _, role := range []string{"Registrant", "Tech", "Admin", "AuxBilling"} {
+		for k, v := range fields {
+			out[role+k] = v
+		}
+	}
+	return out, nil
 }
 
 type server struct {
@@ -270,9 +314,13 @@ func (s *server) register(ctx context.Context, args json.RawMessage) (string, er
 	if !strings.Contains(ans, "approve") && !strings.Contains(ans, "yes") && !strings.Contains(ans, "buy") {
 		return "", fmt.Errorf("the answer %q does not read as approval", q.Answer)
 	}
-	resp, err := s.nc.call(ctx, "namecheap.domains.create", map[string]string{
-		"DomainName": domain, "Years": strconv.Itoa(in.Years), "AddFreeWhoisguard": "yes", "WGEnabled": "yes",
-	})
+	params, err := s.cfg.registrantParams()
+	if err != nil {
+		return "", err
+	}
+	params["DomainName"], params["Years"] = domain, strconv.Itoa(in.Years)
+	params["AddFreeWhoisguard"], params["WGEnabled"] = "yes", "yes"
+	resp, err := s.nc.call(ctx, "namecheap.domains.create", params)
 	if err != nil {
 		return "", err
 	}
