@@ -196,8 +196,10 @@ func toolDefs() []map[string]any {
 			"inputSchema": obj(`{"type":"object","properties":{"tld":{"type":"string","description":"e.g. \"com\", no dot"}},"required":["tld"],"additionalProperties":false}`)},
 		{"name": "register", "description": "Register a domain — SPENDS REAL MONEY from the Namecheap account balance. Requires question_id: an answered Human Queue question whose text names this exact domain and whose answer approves. Also gated by the plugin's spend cap and TLD allowlist. Ask the question with forge_ask first, wait for the answer, then call this.",
 			"inputSchema": obj(`{"type":"object","properties":{"domain":{"type":"string"},"years":{"type":"integer","minimum":1,"maximum":2,"default":1},"question_id":{"type":"string"}},"required":["domain","question_id"],"additionalProperties":false}`)},
-		{"name": "dns_set", "description": "Replace a registered domain's DNS host records (replaces ALL records — include every record the domain should have). For GitHub Pages: four A records @ 185.199.108-111.153 and a www CNAME to <user>.github.io.",
-			"inputSchema": obj(`{"type":"object","properties":{"domain":{"type":"string"},"records":{"type":"array","items":{"type":"object","properties":{"host":{"type":"string","description":"@ or a subdomain"},"type":{"type":"string","enum":["A","AAAA","CNAME","TXT","MX"]},"value":{"type":"string"},"ttl":{"type":"integer","default":1800}},"required":["host","type","value"],"additionalProperties":false},"minItems":1}},"required":["domain","records"],"additionalProperties":false}`)},
+		{"name": "dns_get", "description": "Read a registered domain's current DNS host records and email_type, in the exact shape dns_set accepts. ALWAYS call this before dns_set: dns_set replaces the whole zone, so the safe pattern is get → edit the list → set.",
+			"inputSchema": obj(`{"type":"object","properties":{"domain":{"type":"string"}},"required":["domain"],"additionalProperties":false}`)},
+		{"name": "dns_set", "description": "Replace a registered domain's DNS host records (replaces ALL records — include every record the domain should have, so start from dns_get). Pass email_type back unchanged (e.g. FWD for Namecheap email forwarding) or the account's mail setting is reset. For GitHub Pages: four A records @ 185.199.108-111.153 and a www CNAME to <user>.github.io.",
+			"inputSchema": obj(`{"type":"object","properties":{"domain":{"type":"string"},"email_type":{"type":"string","enum":["MX","MXE","FWD","OX"]},"records":{"type":"array","items":{"type":"object","properties":{"host":{"type":"string","description":"@ or a subdomain"},"type":{"type":"string","enum":["A","AAAA","CNAME","TXT","MX","URL","URL301","FRAME"]},"value":{"type":"string"},"mxpref":{"type":"integer","description":"MX priority; MX records only"},"ttl":{"type":"integer","default":1800}},"required":["host","type","value"],"additionalProperties":false},"minItems":1}},"required":["domain","records"],"additionalProperties":false}`)},
 	}
 }
 
@@ -209,6 +211,8 @@ func (s *server) dispatch(ctx context.Context, name string, args json.RawMessage
 		return s.pricing(ctx, args)
 	case "register":
 		return s.register(ctx, args)
+	case "dns_get":
+		return s.dnsGet(ctx, args)
 	case "dns_set":
 		return s.dnsSet(ctx, args)
 	}
@@ -336,23 +340,78 @@ func (s *server) register(ctx context.Context, args json.RawMessage) (string, er
 	return fmt.Sprintf("REGISTERED %s for %d year(s), charged $%s (authorized by question %s)", domain, in.Years, c.Charged, in.QuestionID), nil
 }
 
+// splitDomain gives Namecheap its SLD/TLD pair, or an error for a bare label.
+func splitDomain(raw string) (sld, tld string, err error) {
+	domain := strings.ToLower(strings.TrimSpace(raw))
+	dot := strings.LastIndex(domain, ".")
+	if dot <= 0 {
+		return "", "", fmt.Errorf("%q is not a domain", domain)
+	}
+	return domain[:dot], domain[dot+1:], nil
+}
+
+func (s *server) dnsGet(ctx context.Context, args json.RawMessage) (string, error) {
+	var in struct {
+		Domain string `json:"domain"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil || in.Domain == "" {
+		return "", errors.New("domain is required")
+	}
+	sld, tld, err := splitDomain(in.Domain)
+	if err != nil {
+		return "", err
+	}
+	resp, err := s.nc.call(ctx, "namecheap.domains.dns.getHosts", map[string]string{"SLD": sld, "TLD": tld})
+	if err != nil {
+		return "", err
+	}
+	// Emitted in dns_set's input shape so an agent can round-trip it verbatim.
+	type rec struct {
+		Host   string `json:"host"`
+		Type   string `json:"type"`
+		Value  string `json:"value"`
+		MXPref int    `json:"mxpref,omitempty"`
+		TTL    int    `json:"ttl"`
+	}
+	out := struct {
+		Domain    string `json:"domain"`
+		EmailType string `json:"email_type"`
+		Records   []rec  `json:"records"`
+	}{Domain: sld + "." + tld, EmailType: resp.Result.DNSGet.EmailType}
+	for _, h := range resp.Result.DNSGet.Hosts {
+		pref, _ := strconv.Atoi(h.MXPref)
+		ttl, _ := strconv.Atoi(h.TTL)
+		out.Records = append(out.Records, rec{Host: h.Name, Type: h.Type, Value: h.Address, MXPref: pref, TTL: ttl})
+	}
+	b, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 func (s *server) dnsSet(ctx context.Context, args json.RawMessage) (string, error) {
 	var in struct {
-		Domain  string `json:"domain"`
-		Records []struct {
+		Domain    string `json:"domain"`
+		EmailType string `json:"email_type"`
+		Records   []struct {
 			Host, Type, Value string
+			MXPref            int
 			TTL               int
 		} `json:"records"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil || in.Domain == "" || len(in.Records) == 0 {
 		return "", errors.New("domain and records[] are required")
 	}
-	domain := strings.ToLower(strings.TrimSpace(in.Domain))
-	dot := strings.LastIndex(domain, ".")
-	if dot <= 0 {
-		return "", fmt.Errorf("%q is not a domain", domain)
+	sld, tld, err := splitDomain(in.Domain)
+	if err != nil {
+		return "", err
 	}
-	params := map[string]string{"SLD": domain[:dot], "TLD": domain[dot+1:]}
+	domain := sld + "." + tld
+	params := map[string]string{"SLD": sld, "TLD": tld}
+	if in.EmailType != "" {
+		params["EmailType"] = in.EmailType
+	}
 	for i, r := range in.Records {
 		n := strconv.Itoa(i + 1)
 		ttl := r.TTL
@@ -363,6 +422,9 @@ func (s *server) dnsSet(ctx context.Context, args json.RawMessage) (string, erro
 		params["RecordType"+n] = r.Type
 		params["Address"+n] = r.Value
 		params["TTL"+n] = strconv.Itoa(ttl)
+		if strings.EqualFold(r.Type, "MX") {
+			params["MXPref"+n] = strconv.Itoa(r.MXPref)
+		}
 	}
 	resp, err := s.nc.call(ctx, "namecheap.domains.dns.setHosts", params)
 	if err != nil {

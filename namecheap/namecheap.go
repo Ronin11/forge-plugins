@@ -1,6 +1,6 @@
 package main
 
-// The Namecheap XML API client: exactly the four calls the tools need.
+// The Namecheap XML API client: exactly the five calls the tools need.
 // https://www.namecheap.com/support/api/methods/
 
 import (
@@ -26,9 +26,9 @@ type apiResponse struct {
 	Errors []ncErr  `xml:"Errors>Error"`
 	Result struct { // union of the result shapes we read
 		Checks []struct {
-			Domain    string `xml:"Domain,attr"`
-			Available string `xml:"Available,attr"`
-			Premium   string `xml:"IsPremiumName,attr"`
+			Domain       string `xml:"Domain,attr"`
+			Available    string `xml:"Available,attr"`
+			Premium      string `xml:"IsPremiumName,attr"`
 			PremiumPrice string `xml:"PremiumRegistrationPrice,attr"`
 		} `xml:"DomainCheckResult"`
 		Created struct {
@@ -39,6 +39,17 @@ type apiResponse struct {
 		DNSSet struct {
 			Success string `xml:"IsSuccess,attr"`
 		} `xml:"DomainDNSSetHostsResult"`
+		DNSGet struct {
+			Domain    string `xml:"Domain,attr"`
+			EmailType string `xml:"EmailType,attr"` // MX | MXE | FWD | OX — setHosts resets this unless resent
+			Hosts     []struct {
+				Name    string `xml:"Name,attr"`
+				Type    string `xml:"Type,attr"`
+				Address string `xml:"Address,attr"`
+				MXPref  string `xml:"MXPref,attr"`
+				TTL     string `xml:"TTL,attr"`
+			} `xml:"host"`
+		} `xml:"DomainDNSGetHostsResult"`
 		Pricing []struct {
 			Name     string `xml:"Name,attr"` // the tld
 			Products []struct {
